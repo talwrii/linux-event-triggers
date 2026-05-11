@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linux-event-triggers"
+version = "0.1.0"
+description = "Run shell commands on Linux input device events; grab the device so X stops seeing them"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "readwithai" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+]
+
+[project.scripts]
+evtrig = "linux_event_triggers.main:main"
+
+[project.urls]
+Homepage = "https://github.com/readwithai/linux-event-triggers"
