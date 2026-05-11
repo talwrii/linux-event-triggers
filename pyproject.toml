@@ -24,4 +24,4 @@ classifiers = [
 evtrig = "linux_event_triggers.main:main"
 
 [project.urls]
-Homepage = "https://github.com/readwithai/linux-event-triggers"
+Homepage = "https://github.com/talwrii/linux-event-triggers"
