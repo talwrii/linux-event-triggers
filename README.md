@@ -1,11 +1,10 @@
 # linux-event-triggers
-Run certain triggers when a linux event device (such as a keyboard or keyboard-emulating device) receives an event. Prevent other processes from receiving the event.
+Execute callbacks such as running commands when a linux event device such as a keyboard or keyboard-emulating device) receives an event. Prevent other processes from receiving the event.
 
 AI-generated and unreviewed.
 
 ## Motivation
 Macroboards and footpedals have a habit of showing up as a keyboard device with fairly standard keys like "a", "b", "c". These conflict with keys that you are already using, for example to insert the character "a", so the entire device must be handled separately. `linux-event-triggers` is a tool to do this.
-
 
 ## Alternatives and prior work
 `kbd` can remap keys for keyboards.  It also supports `command` to run commands. I already used `kbd` as a separate device and didn't want to mix up another device and activity in this.
