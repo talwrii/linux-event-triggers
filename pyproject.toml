@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linux-event-triggers"
-version = "1.0.0"
-description = "Run shell commands on Linux input device events; grab the device so X stops seeing them"
+version = "1.1.0"
+description = "Run shell commands on Linux in response to hardware events; hide these events from X11. Good for macropads "
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
