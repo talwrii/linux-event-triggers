@@ -19,6 +19,7 @@ import signal
 import struct
 import subprocess
 import sys
+import time
 
 
 # struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
@@ -113,6 +114,96 @@ def parse_bind(arg: str) -> tuple[int, str]:
     return NAME_TO_CODE[name], command
 
 
+def _log(msg: str) -> None:
+    """Timestamped stderr log line."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+
+
+def _chown_if_needed(device: str) -> bool:
+    """Run sudo chown on the device. Returns True on success."""
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not user:
+        _log("error: --chown needs $USER or $LOGNAME set in environment")
+        return False
+    try:
+        subprocess.run(["sudo", "chown", user, device], check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        _log(f"error: sudo chown failed: {e}")
+        return False
+
+
+def _open_and_grab(device: str) -> int | None:
+    """Open + EVIOCGRAB the device. Returns fd or None on failure (with logged
+    reason). Does not log for ENOENT (caller decides how to handle missing)."""
+    try:
+        fd = os.open(device, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        _log(f"error: cannot open {device}: {e}")
+        return None
+    try:
+        fcntl.ioctl(fd, EVIOCGRAB, 1)
+    except OSError as e:
+        os.close(fd)
+        if e.errno == errno.EBUSY:
+            _log(
+                f"error: {device} is already grabbed by another process. "
+                f"Find who: sudo lsof {device}"
+            )
+        else:
+            _log(f"error: grab failed: {e}")
+        return None
+    return fd
+
+
+def _wait_for_device(device: str, poll_seconds: float = 0.5) -> None:
+    """Block until os.path.exists(device) is True. Logs at start."""
+    _log(f"waiting for {device} to come back...")
+    while not os.path.exists(device):
+        time.sleep(poll_seconds)
+    _log(f"{device} reappeared")
+
+
+def _read_event_loop(fd: int, bindings: dict[int, str], dump: bool) -> str | None:
+    """Read events until the device goes away or we hit EOF.
+
+    Returns:
+        None on clean EOF (rare),
+        "disconnect" if the device disappeared (caller may want to reconnect),
+        propagates KeyboardInterrupt.
+    """
+    while True:
+        try:
+            data = os.read(fd, EVENT_SIZE)
+        except OSError as e:
+            if e.errno in (errno.ENODEV, errno.EIO):
+                return "disconnect"
+            raise
+        if not data:
+            return None
+        if len(data) != EVENT_SIZE:
+            continue
+        _, _, ev_type, code, value = struct.unpack(EVENT_FORMAT, data)
+        if ev_type != EV_KEY:
+            continue
+        if dump:
+            action = {1: "press", 0: "release", 2: "repeat"}.get(value, str(value))
+            name = next((n for n, c in NAME_TO_CODE.items() if c == code), f"code{code}")
+            print(f"{name} {action}", flush=True)
+        if value != KEY_PRESS:
+            continue
+        cmd = bindings.get(code)
+        if cmd is None:
+            continue
+        try:
+            subprocess.Popen(cmd, shell=True)
+        except OSError as e:
+            _log(f"error running {cmd!r}: {e}")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     bindings: dict[int, str] = {}
     for raw in args.bind or []:
@@ -128,72 +219,57 @@ def cmd_run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    if args.chown:
-        user = os.environ.get("USER") or os.environ.get("LOGNAME")
-        if not user:
-            print("error: --chown needs $USER or $LOGNAME set in environment",
-                  file=sys.stderr)
-            return 1
-        try:
-            subprocess.run(["sudo", "chown", user, args.device], check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"error: sudo chown failed: {e}", file=sys.stderr)
-            return 1
-
-    try:
-        fd = os.open(args.device, os.O_RDONLY)
-    except OSError as e:
-        print(f"error: cannot open {args.device}: {e}", file=sys.stderr)
+    # Initial existence check — fail loudly if the device isn't there at start.
+    if not os.path.exists(args.device):
+        _log(f"error: {args.device} does not exist")
         return 1
 
-    try:
-        fcntl.ioctl(fd, EVIOCGRAB, 1)
-    except OSError as e:
-        os.close(fd)
-        if e.errno == errno.EBUSY:
-            print(
-                f"error: {args.device} is already grabbed by another process. "
-                f"Find who: sudo lsof {args.device}",
-                file=sys.stderr,
-            )
-        else:
-            print(f"error: grab failed: {e}", file=sys.stderr)
+    if args.chown and not _chown_if_needed(args.device):
         return 1
-    print(f"grabbed {args.device}", file=sys.stderr, flush=True)
 
     # Don't accumulate zombies from fire-and-forget Popen calls.
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
+    first_attempt = True
     try:
         while True:
-            data = os.read(fd, EVENT_SIZE)
-            if len(data) != EVENT_SIZE:
+            fd = _open_and_grab(args.device)
+            if fd is None:
+                if first_attempt:
+                    # Device existed at startup but we can't open/grab — bail.
+                    return 1
+                # Was reconnected but open/grab failed transiently; wait and retry.
+                _log("open/grab failed after reconnect, retrying in 1s")
+                time.sleep(1.0)
                 continue
-            _, _, ev_type, code, value = struct.unpack(EVENT_FORMAT, data)
-            if ev_type != EV_KEY:
-                continue
-            if args.dump:
-                action = {1: "press", 0: "release", 2: "repeat"}.get(value, str(value))
-                name = next((n for n, c in NAME_TO_CODE.items() if c == code), f"code{code}")
-                print(f"{name} {action}", flush=True)
-            if value != KEY_PRESS:
-                continue
-            cmd = bindings.get(code)
-            if cmd is None:
-                continue
+            first_attempt = False
+            _log(f"grabbed {args.device}")
             try:
-                subprocess.Popen(cmd, shell=True)
-            except OSError as e:
-                print(f"error running {cmd!r}: {e}", file=sys.stderr, flush=True)
+                outcome = _read_event_loop(fd, bindings, args.dump)
+            finally:
+                try:
+                    fcntl.ioctl(fd, EVIOCGRAB, 0)
+                except OSError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+            if outcome == "disconnect":
+                if args.no_wait:
+                    _log(f"{args.device} disconnected; exiting (--no-wait)")
+                    return 1
+                _log(f"{args.device} disconnected")
+                _wait_for_device(args.device)
+                if args.chown:
+                    _chown_if_needed(args.device)
+                # Loop back round to open+grab.
+                continue
+            # Clean EOF — unusual but treat as exit.
+            return 0
     except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            fcntl.ioctl(fd, EVIOCGRAB, 0)
-        except OSError:
-            pass
-        os.close(fd)
-    return 0
+        return 0
 
 
 def main() -> int:
@@ -230,7 +306,15 @@ def main() -> int:
         help="Run `sudo chown $USER DEVICE` before opening, so evtrig itself "
              "doesn't need to run as root. Pair with a NOPASSWD sudoers entry "
              "to make this passwordless. Ownership reverts when the device is "
-             "unplugged or the system reboots.",
+             "unplugged or the system reboots. Re-applied automatically after "
+             "reconnect.",
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Exit when the device is disconnected mid-run, instead of "
+             "waiting for it to come back. Default behaviour is to log the "
+             "disconnect, poll for the device to reappear, then re-grab.",
     )
     args = parser.parse_args()
     return cmd_run(args)
