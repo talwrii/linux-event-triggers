@@ -27,7 +27,8 @@ This will attempt to use sudo to chown the device file on initial run, potential
 
 You can use udevadm to find a *fixed* path for the event device. This will use the USB device name than a name like `event17`
 
-
 Once you have this working you will likely want to remove the need for a password in sudo. This can be acheived by editting sudoers to support the specific command you need without a password, or wrangling linuxes `udev` device registering system to change ownership. I specifically provided a means of working around udev with `sudo` because udev is too hard to use.
 
+
+You can use the `--dump` flag to find out what events a devie is creating.
 

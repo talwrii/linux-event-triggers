@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 # struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
@@ -120,8 +121,35 @@ def _log(msg: str) -> None:
     print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
 
 
+def _stable_chown_path(device: str) -> str:
+    """A /dev/input/by-path/...-event-kbd symlink that currently resolves to
+    `device`, if one exists. `chown` follows symlinks by default, so this
+    changes nothing about which file actually gets chowned -- but it means
+    the *command string* run is the same across replugs even though the
+    raw /dev/input/eventN target isn't, which is what a device needs for a
+    sudoers NOPASSWD entry to match it without listing every possible
+    eventN number (or every USB port, in --usb-port mode). Falls back to
+    `device` itself if no matching by-path symlink is found."""
+    by_path = Path("/dev/input/by-path")
+    if not by_path.is_dir():
+        return device
+    try:
+        target = Path(device).resolve()
+    except OSError:
+        return device
+    for entry in sorted(by_path.glob("*-event-kbd")):
+        try:
+            if entry.resolve() == target:
+                return str(entry)
+        except OSError:
+            continue
+    return device
+
+
 def _chown_if_needed(device: str) -> bool:
-    """Run sudo chown on the device. Returns True on success."""
+    """Run sudo chown on the device (or the stable by-path symlink to it,
+    see _stable_chown_path). Returns True on success."""
+    device = _stable_chown_path(device)
     user = os.environ.get("USER") or os.environ.get("LOGNAME")
     if not user:
         _log("error: --chown needs $USER or $LOGNAME set in environment")
@@ -167,6 +195,47 @@ def _wait_for_device(device: str, poll_seconds: float = 0.5) -> None:
     _log(f"{device} reappeared")
 
 
+def find_event_device_for_usb_port(port: str) -> str | None:
+    """Resolve a USB port path (e.g. '1-10.1', as shown by `lsusb -t` or the
+    tail of a device's sysfs path) to whichever /dev/input/eventN currently
+    sits on it, or None if nothing does right now.
+
+    This exists for hardware with no usable serial number — two otherwise
+    identical devices (same vendor, product, even 'serial' string on some
+    cheap hardware) are only distinguishable by which physical port they're
+    in. The port path itself is what's stable, not any eventN number, which
+    can and does change across replugs — so this is re-resolved on every
+    (re)connect rather than cached.
+
+    Matches on an exact path *segment* (surrounded by '/' or string edges)
+    so e.g. '1-10.1' doesn't also match '1-10.10'.
+
+    Only nodes udev tags as keyboards count: one USB keyboard often exposes
+    extra 'Consumer Control' / 'System Control' nodes on the same port, and
+    during an unplug those can briefly outlive the keyboard node itself.
+    """
+    needle = f"/{port}/"
+    for entry in sorted(Path("/sys/class/input").glob("event*")):
+        try:
+            real = entry.resolve()
+        except OSError:
+            continue
+        if needle in f"/{real}/" and _is_udev_keyboard(entry):
+            return f"/dev/input/{entry.name}"
+    return None
+
+
+def _is_udev_keyboard(entry: Path) -> bool:
+    """True if udev has tagged this /sys/class/input/eventN as
+    ID_INPUT_KEYBOARD (the same flag behind by-path '-event-kbd' links)."""
+    try:
+        dev = (entry / "dev").read_text().strip()
+        data = Path(f"/run/udev/data/c{dev}").read_text()
+    except OSError:
+        return False
+    return "E:ID_INPUT_KEYBOARD=1" in data.splitlines()
+
+
 def _read_event_loop(fd: int, bindings: dict[int, str], dump: bool) -> str | None:
     """Read events until the device goes away or we hit EOF.
 
@@ -196,6 +265,8 @@ def _read_event_loop(fd: int, bindings: dict[int, str], dump: bool) -> str | Non
         if value != KEY_PRESS:
             continue
         cmd = bindings.get(code)
+        name = next((n for n, c in NAME_TO_CODE.items() if c == code), f"code{code}")
+        _log(f"{name} pressed" + (f" -> {cmd}" if cmd else " (unbound)"))
         if cmd is None:
             continue
         try:
@@ -219,12 +290,36 @@ def cmd_run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
+    def resolve() -> str | None:
+        """Current device path, or None if nothing's there right now.
+
+        In --usb-port mode this is re-resolved every call rather than
+        cached: the eventN a port maps to can (and does) change across
+        replugs, even though the port path itself stays fixed.
+        """
+        if args.usb_port:
+            return find_event_device_for_usb_port(args.usb_port)
+        return args.device if os.path.exists(args.device) else None
+
+    def wait_for_device() -> str:
+        """Block until resolve() finds something, then return it."""
+        label = f"port {args.usb_port}" if args.usb_port else args.device
+        _log(f"waiting for {label} to come back...")
+        while True:
+            device = resolve()
+            if device is not None:
+                _log(f"{label} reappeared as {device}")
+                return device
+            time.sleep(0.5)
+
     # Initial existence check — fail loudly if the device isn't there at start.
-    if not os.path.exists(args.device):
-        _log(f"error: {args.device} does not exist")
+    device = resolve()
+    if device is None:
+        label = f"port {args.usb_port}" if args.usb_port else args.device
+        _log(f"error: {label} does not exist")
         return 1
 
-    if args.chown and not _chown_if_needed(args.device):
+    if args.chown and not _chown_if_needed(device):
         return 1
 
     # Don't accumulate zombies from fire-and-forget Popen calls.
@@ -233,7 +328,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     first_attempt = True
     try:
         while True:
-            fd = _open_and_grab(args.device)
+            fd = _open_and_grab(device)
             if fd is None:
                 if first_attempt:
                     # Device existed at startup but we can't open/grab — bail.
@@ -243,7 +338,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 time.sleep(1.0)
                 continue
             first_attempt = False
-            _log(f"grabbed {args.device}")
+            _log(f"grabbed {device}")
             try:
                 outcome = _read_event_loop(fd, bindings, args.dump)
             finally:
@@ -258,12 +353,12 @@ def cmd_run(args: argparse.Namespace) -> int:
 
             if outcome == "disconnect":
                 if args.no_wait:
-                    _log(f"{args.device} disconnected; exiting (--no-wait)")
+                    _log(f"{device} disconnected; exiting (--no-wait)")
                     return 1
-                _log(f"{args.device} disconnected")
-                _wait_for_device(args.device)
+                _log(f"{device} disconnected")
+                device = wait_for_device()
                 if args.chown:
-                    _chown_if_needed(args.device)
+                    _chown_if_needed(device)
                 # Loop back round to open+grab.
                 continue
             # Clean EOF — unusual but treat as exit.
@@ -283,8 +378,22 @@ def main() -> int:
     )
     parser.add_argument(
         "device",
+        nargs="?",
         help="Path to event device, e.g. /dev/input/event5 or "
-             "/dev/input/by-path/...-event-kbd",
+             "/dev/input/by-path/...-event-kbd. Omit if using --usb-port "
+             "instead.",
+    )
+    parser.add_argument(
+        "--usb-port",
+        metavar="PORT",
+        help="Identify the device by USB port path (e.g. '1-10.1', the tail "
+             "of its sysfs path -- see `udevadm info -q path -n DEVICE`) "
+             "instead of a fixed device path. For hardware with no usable "
+             "serial number, where two otherwise-identical devices are only "
+             "distinguishable by which port they're plugged into. Re-resolved "
+             "on every (re)connect, since eventN numbers aren't stable across "
+             "replugs even though the port path is. Mutually exclusive with "
+             "the device argument.",
     )
     parser.add_argument(
         "--bind",
@@ -317,6 +426,8 @@ def main() -> int:
              "disconnect, poll for the device to reappear, then re-grab.",
     )
     args = parser.parse_args()
+    if bool(args.device) == bool(args.usb_port):
+        parser.error("give exactly one of DEVICE or --usb-port")
     return cmd_run(args)
 
 
